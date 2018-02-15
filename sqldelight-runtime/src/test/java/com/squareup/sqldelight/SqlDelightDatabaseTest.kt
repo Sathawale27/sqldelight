@@ -1,76 +1,101 @@
 package com.squareup.sqldelight
 
-import android.arch.persistence.db.SupportSQLiteDatabase
-import android.arch.persistence.db.SupportSQLiteOpenHelper
-import android.arch.persistence.db.framework.FrameworkSQLiteOpenHelperFactory
 import com.google.common.truth.Truth.assertThat
+import com.squareup.sqldelight.db.SqlDatabaseConnection
+import com.squareup.sqldelight.sqlite.jdbc.SqliteJdbcOpenHelper
+import org.junit.After
+import org.junit.Before
 import org.junit.Test
-import org.junit.runner.RunWith
-import org.robolectric.RobolectricTestRunner
-import org.robolectric.RuntimeEnvironment
 import java.util.concurrent.atomic.AtomicInteger
 
-@RunWith(RobolectricTestRunner::class)
 class SqlDelightDatabaseTest {
-    private val callback = object : SupportSQLiteOpenHelper.Callback() {
-    override fun onCreate(db: SupportSQLiteDatabase) = Unit
+  private lateinit var database: SqlDelightDatabase
+  private lateinit var connection: SqlDatabaseConnection
 
-    override fun onUpgrade(db: SupportSQLiteDatabase?, oldVersion: Int, newVersion: Int) = Unit
+  @Before fun setup() {
+    val databaseHelper = SqliteJdbcOpenHelper()
+    database = object : SqlDelightDatabase(databaseHelper) {}
+    connection = databaseHelper.getConnection()
   }
 
-  private val configuration = SupportSQLiteOpenHelper.Configuration.builder(RuntimeEnvironment.application)
-      .callback(callback)
-      .build()
+  @After fun teardown() {
+    database.close()
+  }
 
-  private val helper = FrameworkSQLiteOpenHelperFactory().create(configuration)
-  private val database = object : SqlDelightDatabase(helper) { }
-
-  @Test fun afterTransactionRunsAfterSuccessfulTransactionEnds() {
+  @Test fun `afterTransaction runs after transaction commits`() {
     val counter = AtomicInteger(0)
-    database.newTransaction().use {
+    database.transaction {
       database.afterTransaction { counter.incrementAndGet() }
-      assertThat(counter.get()).isEqualTo(0)
-      it.markSuccessful()
       assertThat(counter.get()).isEqualTo(0)
     }
 
     assertThat(counter.get()).isEqualTo(1)
   }
 
-  @Test fun afterTransactionDoesNotRunAfterUnsuccessfulTransactionEnds() {
+  @Test fun `afterTransaction does not run after transaction rollbacks`() {
     val counter = AtomicInteger(0)
-    database.newTransaction().use {
+    database.transaction {
       database.afterTransaction { counter.incrementAndGet() }
       assertThat(counter.get()).isEqualTo(0)
+      rollback()
     }
 
     assertThat(counter.get()).isEqualTo(0)
   }
 
-  @Test fun afterTransactionRunsImmediatelyWithNoTransaction() {
+  @Test fun `afterTransaction runs immediately with no transaction`() {
     val counter = AtomicInteger(0)
     database.afterTransaction { counter.incrementAndGet() }
     assertThat(counter.get()).isEqualTo(1)
   }
 
-  @Test fun afterTransactionRunsAfterParentTransactionEnds() {
+  @Test fun `afterTransaction runs after parent transaction commits`() {
     val counter = AtomicInteger(0)
-    database.newTransaction().use {
+    database.transaction {
       database.afterTransaction { counter.incrementAndGet() }
       assertThat(counter.get()).isEqualTo(0)
 
-      database.newTransaction().use {
+      database.transaction {
         database.afterTransaction { counter.incrementAndGet() }
-        assertThat(counter.get()).isEqualTo(0)
-        it.markSuccessful()
         assertThat(counter.get()).isEqualTo(0)
       }
 
       assertThat(counter.get()).isEqualTo(0)
-      it.markSuccessful()
-      assertThat(counter.get()).isEqualTo(0)
     }
 
     assertThat(counter.get()).isEqualTo(2)
+  }
+
+  @Test fun `afterTransaction does not run in nested transaction when parent rolls back`() {
+    val counter = AtomicInteger(0)
+    database.transaction {
+      database.afterTransaction { counter.incrementAndGet() }
+      assertThat(counter.get()).isEqualTo(0)
+
+      database.transaction {
+        database.afterTransaction { counter.incrementAndGet() }
+      }
+
+      rollback()
+    }
+
+    assertThat(counter.get()).isEqualTo(0)
+  }
+
+  @Test fun `afterTransaction does not run in nested transaction when nested rolls back`() {
+    val counter = AtomicInteger(0)
+    database.transaction {
+      database.afterTransaction { counter.incrementAndGet() }
+      assertThat(counter.get()).isEqualTo(0)
+
+      database.transaction {
+        database.afterTransaction { counter.incrementAndGet() }
+        rollback()
+      }
+
+      throw AssertionError()
+    }
+
+    assertThat(counter.get()).isEqualTo(0)
   }
 }

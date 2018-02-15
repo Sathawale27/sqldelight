@@ -1,93 +1,81 @@
+/*
+ * Copyright (C) 2018 Square, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 package com.squareup.sqldelight
 
-import android.arch.persistence.db.SupportSQLiteOpenHelper
-import android.database.sqlite.SQLiteTransactionListener
-import java.io.Closeable
-import java.util.LinkedHashSet
-import java.util.concurrent.TimeUnit
+import com.squareup.sqldelight.SqlDelightDatabase.Transaction
+import com.squareup.sqldelight.db.SqlDatabaseHelper
 
 /**
  * A transaction-aware [SupportSQLiteOpenHelper] wrapper which can queue work to be performed after
  * the active [Transaction] ends with [afterTransaction].
  */
 abstract class SqlDelightDatabase(
-    internal val helper: SupportSQLiteOpenHelper
-) : Transactor, Closeable {
+  internal val helper: SqlDatabaseHelper
+) {
+  private val transactions = ThreadLocal<Transaction>()
+  private val actions = ArrayList<() -> Unit>()
 
-  private val transactions = ThreadLocal<SqliteTransaction>()
-
-  private val transaction = object : Transaction {
-    override fun markSuccessful() {
-      helper.writableDatabase.setTransactionSuccessful()
-    }
-
-    override fun yieldIfContendedSafely(): Boolean {
-      return helper.writableDatabase.yieldIfContendedSafely()
-    }
-
-    override fun yieldIfContendedSafely(sleepAmount: Long, sleepUnit: TimeUnit): Boolean {
-      return helper.writableDatabase.yieldIfContendedSafely(sleepUnit.toMillis(sleepAmount))
-    }
-
-    override fun end() {
-      val transaction = transactions.get() ?: throw IllegalStateException("Not in transaction.")
-      transactions.set(transaction.parent)
-      helper.writableDatabase.endTransaction()
-      if (transaction.commit) {
-        transaction.forEach { function -> afterTransaction(function) }
-      }
-    }
-
-    override fun close() {
-      end()
-    }
-  }
-
-  override fun newTransaction(): Transaction {
-    val transaction = SqliteTransaction(transactions.get())
-    transactions.set(transaction)
-    helper.writableDatabase.beginTransactionWithListener(transaction)
-
-    return this.transaction
-  }
-
-  override fun newNonExclusiveTransaction(): Transaction {
-    val transaction = SqliteTransaction(transactions.get())
-    transactions.set(transaction)
-    helper.writableDatabase.beginTransactionWithListenerNonExclusive(transaction)
-
-    return this.transaction
-  }
-
-  override fun afterTransaction(function: () -> Unit) {
+  fun afterTransaction(function: () -> Unit) {
     val transaction = transactions.get()
     if (transaction != null) {
-      transaction.add(function)
+      actions.add(function)
     } else {
       function()
     }
   }
 
-  override fun close() {
+  fun close() {
     helper.close()
   }
-}
 
-private class SqliteTransaction(
-    val parent: SqliteTransaction?
-) : LinkedHashSet<() -> Unit>(), SQLiteTransactionListener {
-  var commit: Boolean = false
+  fun transaction(body: Transaction.() -> Unit) {
+    val parent = transactions.get()
+    val transaction = Transaction()
 
-  override fun onBegin() {}
+    if (parent == null) {
+      helper.getConnection().beginTransaction()
+    }
 
-  override fun onCommit() {
-    commit = true
+    try {
+      transactions.set(transaction)
+      transaction.body()
+      transaction.successful = true
+    } catch(e: RollbackException) {
+      if (parent != null) throw e
+    } finally {
+      transactions.set(parent)
+      if (parent == null) {
+        if (!transaction.successful || !transaction.childrenSuccessful) {
+          helper.getConnection().rollbackTransaction()
+        } else {
+          helper.getConnection().commitTransaction()
+          while (actions.isNotEmpty()) actions.removeAt(0).invoke()
+        }
+      } else {
+        parent.childrenSuccessful = transaction.successful && transaction.childrenSuccessful
+      }
+    }
   }
 
-  override fun onRollback() {}
+  class Transaction {
+    internal var successful = false
+    internal var childrenSuccessful = true
 
-  override fun toString(): String {
-    val name = String.format("%08x", System.identityHashCode(this))
-    return if (parent == null) name else name + " [" + parent.toString() + ']'
+    fun rollback(): Nothing = throw RollbackException()
   }
+
+  private class RollbackException: RuntimeException()
 }
